@@ -1,0 +1,161 @@
+name: Build Windows
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-amd64:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Prepare embedded assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path assets | Out-Null
+
+          $headers = @{ 'User-Agent' = 'frpc-for-Windows-actions' }
+          if ('${{ github.token }}') {
+            $headers.Authorization = 'Bearer ${{ github.token }}'
+          }
+          $release = Invoke-RestMethod `
+            -Headers $headers `
+            -Uri 'https://api.github.com/repos/fatedier/frp/releases/latest'
+          $asset = $release.assets |
+            Where-Object { $_.name -match '^frp_.*_windows_amd64\.zip$' } |
+            Select-Object -First 1
+          if (-not $asset) {
+            throw 'The latest frp release does not contain a Windows amd64 archive.'
+          }
+
+          Invoke-WebRequest -Headers $headers -Uri $asset.browser_download_url -OutFile frp.zip
+          Expand-Archive -LiteralPath frp.zip -DestinationPath frp-package -Force
+          $frpc = Get-ChildItem frp-package -Recurse -File -Filter frpc.exe |
+            Select-Object -First 1
+          if (-not $frpc) {
+            throw 'frpc.exe was not found in the downloaded archive.'
+          }
+          Copy-Item -LiteralPath $frpc.FullName -Destination assets\frpc.exe -Force
+
+          Add-Type -AssemblyName System.Drawing
+          $bitmap = [System.Drawing.Bitmap]::new(64, 64)
+          $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+          $graphics.Clear([System.Drawing.Color]::FromArgb(37, 99, 235))
+          $font = [System.Drawing.Font]::new('Segoe UI', 34, [System.Drawing.FontStyle]::Bold)
+          $brush = [System.Drawing.Brushes]::White
+          $format = [System.Drawing.StringFormat]::new()
+          $format.Alignment = [System.Drawing.StringAlignment]::Center
+          $format.LineAlignment = [System.Drawing.StringAlignment]::Center
+          $graphics.DrawString('F', $font, $brush, [System.Drawing.RectangleF]::new(0, 0, 64, 64), $format)
+          $icon = [System.Drawing.Icon]::FromHandle($bitmap.GetHicon())
+          $stream = [System.IO.File]::Create((Join-Path $PWD 'frpc-web.ico'))
+          try {
+            $icon.Save($stream)
+          } finally {
+            $stream.Dispose()
+            $icon.Dispose()
+            $format.Dispose()
+            $font.Dispose()
+            $graphics.Dispose()
+            $bitmap.Dispose()
+          }
+
+      - name: Build Windows GUI executable
+        shell: pwsh
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path win64\output | Out-Null
+          go build -trimpath -ldflags '-s -w -H windowsgui' -o win64\output\frpc-web.exe .
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Build Inno Setup installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install innosetup --no-progress -y
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          $iss = @'
+          #define AppName "frpc-web"
+          #define AppVersion "1.0.0"
+          #define AppExeName "frpc-web.exe"
+
+          [Setup]
+          AppId={{9C07B2E7-7D7C-49A6-8EF0-9C3133A57D6D}
+          AppName={#AppName}
+          AppVersion={#AppVersion}
+          DefaultDirName=D:\Program Files\frpc-web
+          DefaultGroupName={#AppName}
+          DisableProgramGroupPage=yes
+          OutputDir=output
+          OutputBaseFilename=frpc-web-for-Windows
+          SetupIconFile=..\frpc-web.ico
+          Compression=lzma2
+          SolidCompression=yes
+          WizardStyle=modern
+          PrivilegesRequired=admin
+          ArchitecturesInstallIn64BitMode=x64compatible
+          UninstallDisplayIcon={app}\{#AppExeName}
+
+          [Files]
+          Source: "output\frpc-web.exe"; DestDir: "{app}"; Flags: ignoreversion
+          Source: "..\frpc-web.ico"; DestDir: "{app}"; Flags: ignoreversion
+
+          [Icons]
+          Name: "{group}\frpc-web"; Filename: "{app}\{#AppExeName}"; Parameters: "open --base ""{app}"""; WorkingDir: "{app}"
+          Name: "{autodesktop}\frpc-web"; Filename: "{app}\{#AppExeName}"; Parameters: "open --base ""{app}"""; WorkingDir: "{app}"
+
+          [Run]
+          Filename: "{app}\{#AppExeName}"; Parameters: "install-services-ui --base ""{app}"" --no-download"; WorkingDir: "{app}"; Flags: runhidden waituntilterminated
+          Filename: "{app}\{#AppExeName}"; Parameters: "open --base ""{app}"""; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
+
+          [UninstallRun]
+          Filename: "{app}\{#AppExeName}"; Parameters: "uninstall --base ""{app}"""; WorkingDir: "{app}"; Flags: runhidden waituntilterminated; RunOnceId: "UninstallFrpcService"
+          '@
+          Set-Content -LiteralPath win64\frpc-web.iss -Value $iss -Encoding utf8
+
+          $iscc = @(
+            'C:\Program Files (x86)\Inno Setup 6\ISCC.exe',
+            'C:\Program Files\Inno Setup 6\ISCC.exe'
+          ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $iscc) {
+            throw 'ISCC.exe was not found after installing Inno Setup.'
+          }
+          & $iscc win64\frpc-web.iss
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: frpc-web-windows-amd64
+          path: |
+            win64/output/frpc-web.exe
+            win64/output/frpc-web-for-Windows.exe
+          if-no-files-found: error
+          retention-days: 30
