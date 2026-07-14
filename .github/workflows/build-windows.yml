@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   windows-amd64:
@@ -159,3 +159,52 @@ jobs:
             win64/output/frpc-web-for-Windows.exe
           if-no-files-found: error
           retention-days: 30
+
+      - name: Publish latest GitHub Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repository = '${{ github.repository }}'
+          $tag = 'latest'
+          $title = 'Latest Windows build'
+          $notes = "Automated Windows build from commit $env:GITHUB_SHA."
+          $assets = @(
+            'win64\output\frpc-web.exe',
+            'win64\output\frpc-web-for-Windows.exe'
+          )
+
+          git tag --force $tag $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          git push origin "refs/tags/$tag" --force
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          gh release view $tag --repo $repository *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release edit $tag `
+              --repo $repository `
+              --target $env:GITHUB_SHA `
+              --title $title `
+              --notes $notes `
+              --latest
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+            gh release upload $tag @assets --repo $repository --clobber
+          } else {
+            gh release create $tag @assets `
+              --repo $repository `
+              --target $env:GITHUB_SHA `
+              --title $title `
+              --notes $notes `
+              --latest
+          }
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
