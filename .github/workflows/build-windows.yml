@@ -148,7 +148,7 @@ jobs:
           retention-days: 30
 
       - name: Publish latest GitHub Release
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
